@@ -2,20 +2,28 @@ use axum::{http::StatusCode, response::Response};
 use shakmaty::{san::SanError, uci::IllegalUciError, variant::VariantPosition, PositionError};
 use thiserror::Error;
 
-use crate::model::GameId;
+use crate::model::{GameId, LaxDate};
 
 #[derive(Error, Debug, Clone)]
 pub enum Error {
     #[error("bad request: {0}")]
-    PositionError(#[from] PositionError<VariantPosition>),
+    PositionError(Box<PositionError<VariantPosition>>),
     #[error("bad request: {0}")]
     IllegalUciError(#[from] IllegalUciError),
     #[error("bad request: {0}")]
     SanError(#[from] SanError),
-    #[error("duplicate game {0}")]
-    DuplicateGame(GameId),
-    #[error("rejected import of {0}")]
-    RejectedImport(GameId),
+    #[error("duplicate game {id}")]
+    DuplicateGame { id: GameId },
+    #[error("rejected import of {id} due to average rating {rating}")]
+    RejectedRating { id: GameId, rating: u16 },
+    #[error("rejected import of {id} due to date {date}")]
+    RejectedDate { id: GameId, date: LaxDate },
+}
+
+impl From<PositionError<VariantPosition>> for Error {
+    fn from(error: PositionError<VariantPosition>) -> Error {
+        Error::PositionError(Box::new(error))
+    }
 }
 
 impl axum::response::IntoResponse for Error {

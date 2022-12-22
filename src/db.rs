@@ -1,5 +1,6 @@
-use std::path::Path;
+use std::path::PathBuf;
 
+use clap::Parser;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
     MergeOperands, Options, ReadOptions, SliceTransform, WriteBatch, DB,
@@ -12,6 +13,20 @@ use crate::{
         PlayerEntry, PlayerStatus, Stats, UserId, Year,
     },
 };
+
+#[derive(Parser)]
+pub struct DbOpt {
+    /// Path to RocksDB database.
+    #[arg(long, default_value = "_db")]
+    db: PathBuf,
+    /// Tune compaction readahead for spinning disks.
+    #[arg(long)]
+    db_compaction_readahead: bool,
+    /// Size of RocksDB LRU cache. Leave the majority for operating system
+    /// page cache.
+    #[arg(long, default_value = "4294967296")]
+    db_cache: usize,
+}
 
 #[derive(Debug)]
 pub struct Database {
@@ -33,7 +48,7 @@ impl Column<'_> {
         // https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning.
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_cache(self.cache);
-        table_opts.set_block_size(16 * 1024);
+        table_opts.set_block_size(64 * 1024); // Spinning disks
         table_opts.set_cache_index_and_filter_blocks(true);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         table_opts.set_hybrid_ribbon_filter(8.0, 1);
@@ -45,7 +60,6 @@ impl Column<'_> {
         cf_opts.set_compression_type(DBCompressionType::Lz4);
         cf_opts.set_bottommost_compression_type(DBCompressionType::Zstd);
         cf_opts.set_level_compaction_dynamic_level_bytes(false); // Infinitely growing database
-        cf_opts.set_optimize_filters_for_hits(true); // 90% filter size reduction
 
         cf_opts.set_prefix_extractor(match self.prefix {
             Some(prefix) => SliceTransform::create_fixed_prefix(prefix),
@@ -61,27 +75,29 @@ impl Column<'_> {
 }
 
 impl Database {
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Database, rocksdb::Error> {
+    pub fn open(opt: DbOpt) -> Result<Database, rocksdb::Error> {
         // Note on usage in async contexts: All database operations are
         // blocking (https://github.com/facebook/rocksdb/issues/3254).
-        // Calls could be run in a thread-pool to avoid blocking other
-        // requests, but (as benchmarked) this doesn't do much, because all
-        // other requests are doing the same kind of briefly-blocking i/o
-        // anyway.
+        // Calls should be run in a thread-pool to avoid blocking other
+        // requests.
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         db_opts.set_max_background_jobs(4);
-        db_opts.set_bytes_per_sync(1024 * 1024);
+        db_opts.set_bytes_per_sync(1024 * 1024); // at least 1 MiB recommended
+        db_opts.set_write_buffer_size(128 * 1024 * 1024); // bulk loads
+        db_opts.set_skip_stats_update_on_db_open(true); // faster open
 
-        // Target memory usage is 16 GiB. Leave the majority for operating
-        // system page cache.
-        let cache = Cache::new_lru_cache(4 * 1024 * 1024 * 1024)?;
+        if opt.db_compaction_readahead {
+            db_opts.set_compaction_readahead_size(2 * 1024 * 1024);
+        }
+
+        let cache = Cache::new_lru_cache(opt.db_cache)?;
 
         let inner = DB::open_cf_descriptors(
             &db_opts,
-            path,
+            opt.db,
             vec![
                 // Masters database
                 Column {

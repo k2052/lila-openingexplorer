@@ -8,28 +8,28 @@ pub mod model;
 pub mod opening;
 pub mod util;
 
-use std::{mem, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{mem, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Extension, Path, Query},
+    extract::{FromRef, Path, Query, State},
     http::StatusCode,
     routing::{get, post, put},
     Json, Router,
 };
 use clap::Parser;
 use futures_util::stream::Stream;
-use moka::sync::Cache;
+use moka::future::Cache;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 use shakmaty::{
     san::{San, SanPlus},
     uci::Uci,
     variant::VariantPosition,
-    Color,
+    zobrist::ZobristHash,
+    Color, EnPassantMode,
 };
 use tikv_jemallocator::Jemalloc;
-use tokio::sync::watch;
-use tower::ServiceBuilder;
+use tokio::{sync::watch, task};
 
 use crate::{
     api::{
@@ -37,7 +37,7 @@ use crate::{
         ExplorerResponse, LichessHistoryQuery, LichessQuery, Limits, MastersQuery, NdJson,
         PlayPosition, PlayerQuery, PlayerQueryFilter,
     },
-    db::{Database, LichessDatabase},
+    db::{Database, DbOpt, LichessDatabase},
     importer::{LichessGameImport, LichessImporter, MastersImporter},
     indexer::{IndexerOpt, IndexerStub},
     model::{GameId, KeyBuilder, KeyPrefix, MastersGame, MastersGameWithId, PreparedMove, UserId},
@@ -52,21 +52,74 @@ static GLOBAL: Jemalloc = Jemalloc;
 struct Opt {
     /// Binding address. Note that administrative endpoints must be protected
     /// using a reverse proxy.
-    #[clap(long, default_value = "127.0.0.1:9002")]
+    #[arg(long, default_value = "127.0.0.1:9002")]
     bind: SocketAddr,
-    /// Path to RocksDB database
-    #[clap(long, default_value = "_db")]
-    db: PathBuf,
     /// Allow access from all origins.
-    #[clap(long)]
+    #[arg(long)]
     cors: bool,
-    #[clap(flatten)]
+    /// Number of cached responses for masters and Lichess database each.
+    #[arg(long, default_value = "2000")]
+    cached_responses: u64,
+    #[command(flatten)]
+    db: DbOpt,
+    #[command(flatten)]
     indexer: IndexerOpt,
-    #[clap(long, default_value = "2000")]
-    cache_size: u64,
 }
 
 type ExplorerCache<T> = Cache<T, Result<Json<ExplorerResponse>, Error>>;
+
+#[derive(Clone)]
+struct AppState {
+    openings: &'static Openings,
+    db: Arc<Database>,
+    lichess_cache: ExplorerCache<LichessQuery>,
+    masters_cache: ExplorerCache<MastersQuery>,
+    lichess_importer: LichessImporter,
+    masters_importer: MastersImporter,
+    indexer: IndexerStub,
+}
+
+impl FromRef<AppState> for &'static Openings {
+    fn from_ref(state: &AppState) -> &'static Openings {
+        state.openings
+    }
+}
+
+impl FromRef<AppState> for Arc<Database> {
+    fn from_ref(state: &AppState) -> Arc<Database> {
+        Arc::clone(&state.db)
+    }
+}
+
+impl FromRef<AppState> for ExplorerCache<LichessQuery> {
+    fn from_ref(state: &AppState) -> ExplorerCache<LichessQuery> {
+        state.lichess_cache.clone()
+    }
+}
+
+impl FromRef<AppState> for ExplorerCache<MastersQuery> {
+    fn from_ref(state: &AppState) -> ExplorerCache<MastersQuery> {
+        state.masters_cache.clone()
+    }
+}
+
+impl FromRef<AppState> for LichessImporter {
+    fn from_ref(state: &AppState) -> LichessImporter {
+        state.lichess_importer.clone()
+    }
+}
+
+impl FromRef<AppState> for MastersImporter {
+    fn from_ref(state: &AppState) -> MastersImporter {
+        state.masters_importer.clone()
+    }
+}
+
+impl FromRef<AppState> for IndexerStub {
+    fn from_ref(state: &AppState) -> IndexerStub {
+        state.indexer.clone()
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -82,21 +135,8 @@ async fn main() {
 
     let opt = Opt::parse();
 
-    let openings: &'static Openings = Box::leak(Box::new(Openings::build_table()));
     let db = Arc::new(Database::open(opt.db).expect("db"));
     let (indexer, join_handles) = IndexerStub::spawn(Arc::clone(&db), opt.indexer);
-    let masters_importer = MastersImporter::new(Arc::clone(&db));
-    let lichess_importer = LichessImporter::new(Arc::clone(&db));
-
-    let lichess_cache: ExplorerCache<LichessQuery> = Cache::builder()
-        .max_capacity(opt.cache_size)
-        .time_to_live(Duration::from_secs(5 * 60))
-        .build();
-
-    let masters_cache: ExplorerCache<MastersQuery> = Cache::builder()
-        .max_capacity(opt.cache_size)
-        .time_to_live(Duration::from_secs(5 * 60))
-        .build();
 
     let app = Router::new()
         .route("/monitor/cf/:cf/:prop", get(cf_prop))
@@ -113,16 +153,21 @@ async fn main() {
         .route("/master/pgn/:id", get(masters_pgn)) // bc
         .route("/master", get(masters)) // bc
         .route("/personal", get(player)) // bc
-        .layer(
-            ServiceBuilder::new()
-                .layer(Extension(openings))
-                .layer(Extension(db))
-                .layer(Extension(masters_cache))
-                .layer(Extension(lichess_cache))
-                .layer(Extension(masters_importer))
-                .layer(Extension(lichess_importer))
-                .layer(Extension(indexer)),
-        );
+        .with_state(AppState {
+            openings: Box::leak(Box::new(Openings::build_table())),
+            lichess_cache: Cache::builder()
+                .max_capacity(opt.cached_responses)
+                .time_to_live(Duration::from_secs(5 * 60))
+                .build(),
+            masters_cache: Cache::builder()
+                .max_capacity(opt.cached_responses)
+                .time_to_live(Duration::from_secs(5 * 60))
+                .build(),
+            lichess_importer: LichessImporter::new(Arc::clone(&db)),
+            masters_importer: MastersImporter::new(Arc::clone(&db)),
+            indexer,
+            db,
+        });
 
     let app = if opt.cors {
         app.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
@@ -151,34 +196,44 @@ struct ColumnFamilyProp {
 
 async fn cf_prop(
     Path(path): Path<ColumnFamilyProp>,
-    Extension(db): Extension<Arc<Database>>,
+    State(db): State<Arc<Database>>,
 ) -> Result<String, StatusCode> {
-    db.inner
-        .cf_handle(&path.cf)
-        .and_then(|cf| {
-            db.inner
-                .property_value_cf(cf, &path.prop)
-                .expect("property value")
-        })
-        .ok_or(StatusCode::NOT_FOUND)
+    task::spawn_blocking(move || {
+        db.inner
+            .cf_handle(&path.cf)
+            .and_then(|cf| {
+                db.inner
+                    .property_value_cf(cf, &path.prop)
+                    .expect("property value")
+            })
+            .ok_or(StatusCode::NOT_FOUND)
+    })
+    .await
+    .expect("blocking cf prop")
 }
 
 async fn db_prop(
     Path(prop): Path<String>,
-    Extension(db): Extension<Arc<Database>>,
+    State(db): State<Arc<Database>>,
 ) -> Result<String, StatusCode> {
-    db.inner
-        .property_value(&prop)
-        .expect("property value")
-        .ok_or(StatusCode::NOT_FOUND)
+    task::spawn_blocking(move || {
+        db.inner
+            .property_value(&prop)
+            .expect("property value")
+            .ok_or(StatusCode::NOT_FOUND)
+    })
+    .await
+    .expect("blocking db prop")
 }
 
-async fn num_indexing(Extension(indexer): Extension<IndexerStub>) -> String {
+async fn num_indexing(State(indexer): State<IndexerStub>) -> String {
     indexer.num_indexing().await.to_string()
 }
 
-async fn compact(Extension(db): Extension<Arc<Database>>) {
-    db.compact();
+async fn compact(State(db): State<Arc<Database>>) {
+    task::spawn_blocking(move || db.compact())
+        .await
+        .expect("blocking compact");
 }
 
 fn finalize_lichess_moves(
@@ -243,19 +298,16 @@ struct PlayerStreamState {
 }
 
 async fn player(
-    Extension(openings): Extension<&'static Openings>,
-    Extension(db): Extension<Arc<Database>>,
-    Extension(indexer): Extension<IndexerStub>,
+    State(openings): State<&'static Openings>,
+    State(db): State<Arc<Database>>,
+    State(indexer): State<IndexerStub>,
     Query(query): Query<PlayerQuery>,
 ) -> Result<NdJson<impl Stream<Item = ExplorerResponse>>, Error> {
     let player = UserId::from(query.player);
     let indexing = indexer.index_player(&player).await;
-    let PlayPosition {
-        variant,
-        pos,
-        opening,
-    } = query.play.position(openings)?;
-    let key = KeyBuilder::player(&player, query.color).with_zobrist(variant, pos.zobrist_hash());
+    let PlayPosition { pos, opening } = query.play.position(openings)?;
+    let key = KeyBuilder::player(&player, query.color)
+        .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
 
     let state = PlayerStreamState {
         color: query.color,
@@ -265,7 +317,7 @@ async fn player(
         indexing,
         opening,
         key,
-        pos: pos.into_inner(),
+        pos,
         first: true,
         done: false,
     };
@@ -288,31 +340,35 @@ async fn player(
                 None => true,
             };
 
-            let lichess_db = state.db.lichess();
-            let filtered = lichess_db
-                .read_player(&state.key, state.filter.since, state.filter.until)
-                .expect("read player")
-                .prepare(state.color, &state.filter, &state.limits);
+            task::spawn_blocking(move || {
+                let lichess_db = state.db.lichess();
+                let filtered = lichess_db
+                    .read_player(&state.key, state.filter.since, state.filter.until)
+                    .expect("read player")
+                    .prepare(state.color, &state.filter, &state.limits);
 
-            Some((
-                ExplorerResponse {
-                    total: filtered.total,
-                    moves: finalize_lichess_moves(filtered.moves, &state.pos, &lichess_db),
-                    recent_games: Some(finalize_lichess_games(filtered.recent_games, &lichess_db)),
-                    top_games: None,
-                    opening: state.opening,
-                },
-                state,
-            ))
+                Some((
+                    ExplorerResponse {
+                        total: filtered.total,
+                        moves: finalize_lichess_moves(filtered.moves, &state.pos, &lichess_db),
+                        recent_games: Some(finalize_lichess_games(filtered.recent_games, &lichess_db)),
+                        top_games: None,
+                        opening: state.opening,
+                    },
+                    state,
+                ))
+            }).await.expect("blocking player")
         },
     ).dedup_by_key(|res| res.total.total())))
 }
 
 async fn masters_import(
+    State(importer): State<MastersImporter>,
     Json(body): Json<MastersGameWithId>,
-    Extension(importer): Extension<MastersImporter>,
 ) -> Result<(), Error> {
-    importer.import(body).await
+    task::spawn_blocking(move || importer.import(body))
+        .await
+        .expect("blocking masters import")
 }
 
 #[serde_as]
@@ -321,134 +377,144 @@ struct MastersGameId(#[serde_as(as = "DisplayFromStr")] GameId);
 
 async fn masters_pgn(
     Path(MastersGameId(id)): Path<MastersGameId>,
-    Extension(db): Extension<Arc<Database>>,
+    State(db): State<Arc<Database>>,
 ) -> Result<MastersGame, StatusCode> {
-    match db.masters().game(id).expect("get masters game") {
-        Some(game) => Ok(game),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    task::spawn_blocking(
+        move || match db.masters().game(id).expect("get masters game") {
+            Some(game) => Ok(game),
+            None => Err(StatusCode::NOT_FOUND),
+        },
+    )
+    .await
+    .expect("blocking masters pgn")
 }
 
 async fn masters(
-    Extension(openings): Extension<&'static Openings>,
-    Extension(db): Extension<Arc<Database>>,
-    Extension(masters_cache): Extension<ExplorerCache<MastersQuery>>,
+    State(openings): State<&'static Openings>,
+    State(db): State<Arc<Database>>,
+    State(masters_cache): State<ExplorerCache<MastersQuery>>,
     Query(query): Query<MastersQuery>,
 ) -> Result<Json<ExplorerResponse>, Error> {
-    masters_cache.get_with(query.clone(), || {
-        let PlayPosition {
-            variant,
-            pos,
-            opening,
-        } = query.play.position(openings)?;
-        let key = KeyBuilder::masters().with_zobrist(variant, pos.zobrist_hash());
-        let masters_db = db.masters();
-        let entry = masters_db
-            .read(key, query.since, query.until)
-            .expect("get masters")
-            .prepare(&query.limits);
+    masters_cache
+        .get_with(query.clone(), async move {
+            task::spawn_blocking(move || {
+                let PlayPosition { pos, opening } = query.play.position(openings)?;
+                let key = KeyBuilder::masters()
+                    .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
+                let masters_db = db.masters();
+                let entry = masters_db
+                    .read(key, query.since, query.until)
+                    .expect("get masters")
+                    .prepare(&query.limits);
 
-        Ok(Json(ExplorerResponse {
-            total: entry.total,
-            moves: entry
-                .moves
-                .into_iter()
-                .map(|p| ExplorerMove {
-                    san: p.uci.to_move(&pos).map_or(
-                        SanPlus {
-                            san: San::Null,
-                            suffix: None,
-                        },
-                        |m| SanPlus::from_move(pos.clone(), &m),
-                    ),
-                    uci: p.uci,
-                    average_rating: p.average_rating,
-                    average_opponent_rating: p.average_opponent_rating,
-                    performance: p.performance,
-                    stats: p.stats,
-                    game: p.game.and_then(|id| {
-                        masters_db
-                            .game(id)
-                            .expect("get masters game")
-                            .map(|info| ExplorerGame::from_masters(id, info))
-                    }),
-                })
-                .collect(),
-            top_games: Some(
-                masters_db
-                    .games(entry.top_games.iter().map(|(_, id)| *id))
-                    .expect("get masters games")
-                    .into_iter()
-                    .zip(entry.top_games.into_iter())
-                    .filter_map(|(info, (uci, id))| {
-                        info.map(|info| ExplorerGameWithUci {
-                            uci: uci.clone(),
-                            row: ExplorerGame::from_masters(id, info),
+                Ok(Json(ExplorerResponse {
+                    total: entry.total,
+                    moves: entry
+                        .moves
+                        .into_iter()
+                        .map(|p| ExplorerMove {
+                            san: p.uci.to_move(&pos).map_or(
+                                SanPlus {
+                                    san: San::Null,
+                                    suffix: None,
+                                },
+                                |m| SanPlus::from_move(pos.clone(), &m),
+                            ),
+                            uci: p.uci,
+                            average_rating: p.average_rating,
+                            average_opponent_rating: p.average_opponent_rating,
+                            performance: p.performance,
+                            stats: p.stats,
+                            game: p.game.and_then(|id| {
+                                masters_db
+                                    .game(id)
+                                    .expect("get masters game")
+                                    .map(|info| ExplorerGame::from_masters(id, info))
+                            }),
                         })
-                    })
-                    .collect(),
-            ),
-            opening,
-            recent_games: None,
-        }))
-    })
+                        .collect(),
+                    top_games: Some(
+                        masters_db
+                            .games(entry.top_games.iter().map(|(_, id)| *id))
+                            .expect("get masters games")
+                            .into_iter()
+                            .zip(entry.top_games.into_iter())
+                            .filter_map(|(info, (uci, id))| {
+                                info.map(|info| ExplorerGameWithUci {
+                                    uci: uci.clone(),
+                                    row: ExplorerGame::from_masters(id, info),
+                                })
+                            })
+                            .collect(),
+                    ),
+                    opening,
+                    recent_games: None,
+                }))
+            })
+            .await
+            .expect("blocking masters")
+        })
+        .await
 }
 
 async fn lichess_import(
+    State(importer): State<LichessImporter>,
     Json(body): Json<Vec<LichessGameImport>>,
-    Extension(importer): Extension<LichessImporter>,
 ) -> Result<(), Error> {
-    for game in body {
-        importer.import(game).await?;
-    }
-    Ok(())
+    task::spawn_blocking(move || importer.import_many(body))
+        .await
+        .expect("blocking lichess import")
 }
 
 async fn lichess(
-    Extension(openings): Extension<&'static Openings>,
-    Extension(db): Extension<Arc<Database>>,
-    Extension(lichess_cache): Extension<ExplorerCache<LichessQuery>>,
+    State(openings): State<&'static Openings>,
+    State(db): State<Arc<Database>>,
+    State(lichess_cache): State<ExplorerCache<LichessQuery>>,
     Query(query): Query<LichessQuery>,
 ) -> Result<Json<ExplorerResponse>, Error> {
-    lichess_cache.get_with(query.clone(), || {
-        let PlayPosition {
-            variant,
-            pos,
-            opening,
-        } = query.play.position(openings)?;
-        let key = KeyBuilder::lichess().with_zobrist(variant, pos.zobrist_hash());
-        let lichess_db = db.lichess();
-        let filtered = lichess_db
-            .read_lichess(&key, query.filter.since, query.filter.until)
-            .expect("get lichess")
-            .prepare(&query.filter, &query.limits);
+    lichess_cache
+        .get_with(query.clone(), async move {
+            task::spawn_blocking(move || {
+                let PlayPosition { pos, opening } = query.play.position(openings)?;
+                let key = KeyBuilder::lichess()
+                    .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
+                let lichess_db = db.lichess();
+                let filtered = lichess_db
+                    .read_lichess(&key, query.filter.since, query.filter.until)
+                    .expect("get lichess")
+                    .prepare(&query.filter, &query.limits);
 
-        Ok(Json(ExplorerResponse {
-            total: filtered.total,
-            moves: finalize_lichess_moves(filtered.moves, pos.as_inner(), &lichess_db),
-            recent_games: Some(finalize_lichess_games(filtered.recent_games, &lichess_db)),
-            top_games: Some(finalize_lichess_games(filtered.top_games, &lichess_db)),
-            opening,
-        }))
-    })
+                Ok(Json(ExplorerResponse {
+                    total: filtered.total,
+                    moves: finalize_lichess_moves(filtered.moves, &pos, &lichess_db),
+                    recent_games: Some(finalize_lichess_games(filtered.recent_games, &lichess_db)),
+                    top_games: Some(finalize_lichess_games(filtered.top_games, &lichess_db)),
+                    opening,
+                }))
+            })
+            .await
+            .expect("blocking lichess")
+        })
+        .await
 }
 
 async fn lichess_history(
-    Extension(openings): Extension<&'static Openings>,
-    Extension(db): Extension<Arc<Database>>,
+    State(openings): State<&'static Openings>,
+    State(db): State<Arc<Database>>,
     Query(query): Query<LichessHistoryQuery>,
 ) -> Result<Json<ExplorerHistoryResponse>, Error> {
-    let PlayPosition {
-        variant,
-        pos,
-        opening,
-    } = query.play.position(openings)?;
-    let key = KeyBuilder::lichess().with_zobrist(variant, pos.zobrist_hash());
-    let lichess_db = db.lichess();
-    Ok(Json(ExplorerHistoryResponse {
-        history: lichess_db
-            .read_lichess_history(&key, &query.filter)
-            .expect("get lichess history"),
-        opening,
-    }))
+    task::spawn_blocking(move || {
+        let PlayPosition { pos, opening } = query.play.position(openings)?;
+        let key = KeyBuilder::lichess()
+            .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
+        let lichess_db = db.lichess();
+        Ok(Json(ExplorerHistoryResponse {
+            history: lichess_db
+                .read_lichess_history(&key, &query.filter)
+                .expect("get lichess history"),
+            opening,
+        }))
+    })
+    .await
+    .expect("blocking lichess history")
 }

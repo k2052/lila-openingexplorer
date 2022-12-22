@@ -5,8 +5,9 @@ use std::{
 };
 
 use bytes::{Buf, BufMut};
-use rustc_hash::FxHashMap;
+use nohash_hasher::IntMap;
 use shakmaty::{uci::Uci, Color, Outcome};
+use thin_vec::thin_vec;
 
 use crate::{
     api::{Limits, PlayerQueryFilter},
@@ -72,7 +73,7 @@ impl Header {
 
 #[derive(Default, Debug)]
 pub struct PlayerEntry {
-    sub_entries: FxHashMap<RawUci, BySpeed<ByMode<LichessGroup>>>,
+    sub_entries: IntMap<RawUci, BySpeed<ByMode<LichessGroup>>>,
     min_game_idx: Option<u64>,
     max_game_idx: Option<u64>,
 }
@@ -91,7 +92,7 @@ impl PlayerEntry {
         let mut sub_entry: BySpeed<ByMode<LichessGroup>> = Default::default();
         *sub_entry.by_speed_mut(speed).by_mode_mut(mode) = LichessGroup {
             stats: Stats::new_single(outcome, opponent_rating),
-            games: vec![(0, game_id)],
+            games: thin_vec![(0, game_id)],
         };
         PlayerEntry {
             sub_entries: [(RawUci::from(uci), sub_entry)].into_iter().collect(),
@@ -284,7 +285,7 @@ impl PlayerStatus {
         SystemTime::now()
             .duration_since(self.indexed_at)
             .map_or(false, |cooldown| cooldown > Duration::from_secs(60))
-            .then(|| IndexRun::Index {
+            .then_some(IndexRun::Index {
                 after: self.latest_created_at,
             })
     }

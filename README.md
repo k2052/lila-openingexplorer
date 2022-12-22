@@ -4,10 +4,10 @@ lila-openingexplorer
 [![Test](https://github.com/lichess-org/lila-openingexplorer/actions/workflows/test.yml/badge.svg)](https://github.com/lichess-org/lila-openingexplorer/actions/workflows/test.yml)
 
 [Opening explorer](https://lichess.org/blog/Vs0xMTAAAD4We4Ey/opening-explorer)
-for lichess.org, capable of handling billions of positions, featuring:
+for lichess.org, capable of handling trillions of positions, featuring:
 
 * A database of master games
-* Sampled games from Lichess itself
+* [Rated games from Lichess itself](https://database.lichess.org/)
 * An on-demand database of [openings by player](https://lichess.org/blog/YXMPxxMAACEAy3g4/announcing-the-personal-opening-explorer)
 
 Usage
@@ -29,23 +29,12 @@ It's best to whitelist only `/masters`, `/lichess`, and `/player`.
 
 1. Download database dumps from https://database.lichess.org/.
 
-2. Decompress and index.
+2. Index (optionally works directly with compressed files):
 
    ```
    cd index-pgn
-   pbunzip2 *.pgn.bz2
-   cargo run --release -- *.pgn
+   cargo run --release -- *.pgn.zst
    ```
-
-   Or directly import compressed files, if you're short on space.
-
-   ```
-   cd index-pgn
-   cargo run --release -- *.pgn.bz2
-   ```
-
-Note that this does not import *all* games. Sampling rates are hardcoded in
-`index-pgn/src/bin/index-lichess.rs`.
 
 HTTP API
 --------

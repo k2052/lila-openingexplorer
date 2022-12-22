@@ -2,7 +2,7 @@ use std::array::TryFromSliceError;
 
 use bytes::{Buf, BufMut};
 use sha1::{Digest, Sha1};
-use shakmaty::{variant::Variant, Color};
+use shakmaty::{variant::Variant, zobrist::Zobrist128, Color};
 
 use crate::model::{InvalidDate, Month, UserId, Year};
 
@@ -14,7 +14,7 @@ pub struct KeyBuilder {
 impl KeyBuilder {
     pub fn player(user: &UserId, color: Color) -> KeyBuilder {
         let mut hash = Sha1::new();
-        hash.update(&[color.char() as u8]);
+        hash.update([color.char() as u8]);
         hash.update(user.as_lowercase_str());
         let buf = hash.finalize();
         KeyBuilder {
@@ -30,7 +30,7 @@ impl KeyBuilder {
         KeyBuilder { base: 0 }
     }
 
-    pub fn with_zobrist(&self, variant: Variant, zobrist: u128) -> KeyPrefix {
+    pub fn with_zobrist(&self, variant: Variant, zobrist: Zobrist128) -> KeyPrefix {
         // Zobrist hashes are the opposite of cryptographically secure. An
         // attacker could efficiently construct a position such that a record
         // will appear in the opening explorer of another player. This is not
@@ -39,7 +39,7 @@ impl KeyBuilder {
         // and then also stop using SHA1 in with_user_pov().
         KeyPrefix {
             prefix: (self.base
-                ^ zobrist
+                ^ u128::from(zobrist)
                 ^ (match variant {
                     Variant::Chess => 0,
                     Variant::Antichess => 0x44782fce075483666c81899cb65921c9,
@@ -113,7 +113,7 @@ mod tests {
         fn test_key_order(a: Month, b: Month) -> bool {
             let user_id = UserId::from("blindfoldpig".parse::<UserName>().unwrap());
             let prefix = KeyBuilder::player(&user_id, Color::White)
-                .with_zobrist(Variant::Chess, 0xd1d06239bd7d2ae8ad6fa208133e1f9a);
+                .with_zobrist(Variant::Chess, Zobrist128(0xd1d06239bd7d2ae8ad6fa208133e1f9a));
 
             (a <= b) == (prefix.with_month(a).into_bytes() <= prefix.with_month(b).into_bytes())
         }

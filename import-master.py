@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import base64
 import chess
 import chess.pgn
@@ -61,4 +63,3 @@ def deterministic_id(obj):
 
 if __name__ == "__main__":
     main(open(sys.argv[1], errors="ignore"))
-

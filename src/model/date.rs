@@ -81,7 +81,7 @@ impl Year {
     }
 
     pub fn max_masters() -> Year {
-        Year(2021)
+        Year(2022)
     }
 
     #[must_use]
@@ -170,11 +170,7 @@ impl FromStr for Month {
                 let month_plus_one: u16 =
                     month_part.parse().map_err(|_| InvalidDate::InvalidMonth)?;
 
-                if MIN_YEAR <= year
-                    && year <= MAX_YEAR
-                    && 1 <= month_plus_one
-                    && month_plus_one <= 12
-                {
+                if (MIN_YEAR..=MAX_YEAR).contains(&year) && (1..=12).contains(&month_plus_one) {
                     Ok(Month(year * 12 + month_plus_one - 1))
                 } else {
                     Err(InvalidDate::InvalidMonth)
