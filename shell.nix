@@ -17,7 +17,11 @@
     xorg.libXcursor
     xorg.libXrandr
     xorg.libXi
+    openssl
     vulkan-loader
+    clang
+    stdenv.cc.cc.lib
     libclang
+    cmake
   ]);
 }
